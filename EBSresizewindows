@@ -1,0 +1,117 @@
+description: '## EBS Resize and Expand Volume'
+schemaVersion: '0.3'
+assumeRole: 'arn:aws:iam::079697969914:role/AmazonSSMRoleForAutomationAssumeQuickSetup'
+outputs:
+- getInstanceDetails.Instance
+- getRootVolumeId.rootVolumeId
+- createSnapshot.Payload
+parameters:
+  InstanceId:
+    type: String
+    description: (Required) ID of your EC2 Windows managed instance.
+  Size:
+    type: Integer
+    description: (Required) Target size for the selected volume in GB
+  Description:
+    type: String
+    description: "(Optional) A description for the snapshot"
+    default: ''
+mainSteps:
+  - name: getInstanceDetails
+    action: aws:executeAwsApi
+    onFailure: Abort
+    inputs:
+      Service: ec2
+      Api: DescribeInstances
+      InstanceIds:
+        - '{{ InstanceId }}'
+    outputs:
+    - Name: VolumeId
+      Selector: "$.Reservations[0].Instances[0].BlockDeviceMappings.EBS.VolumeId"
+      Type: String
+    - Name: Instance
+      Selector: "$.Reservations[0].Instances[0].InstanceId"
+      Type: String
+    - Name: rootDeviceName
+      Selector: "$.Reservations[0].Instances[0].RootDeviceName"
+      Type: String
+  - name: getRootVolumeId
+    action: aws:executeAwsApi
+    maxAttempts: 3
+    onFailure: Abort
+    inputs:
+      Service: ec2
+      Api: DescribeVolumes
+      Filters:
+      -  Name: attachment.device
+         Values: ["{{ getInstanceDetails.rootDeviceName }}"]
+      -  Name: attachment.instance-id
+         Values: ["{{ getInstanceDetails.Instance }}"]
+    outputs:
+      - Name: rootVolumeId
+        Selector: "$.Volumes[0].VolumeId"
+        Type: String
+  - name: createSnapshot
+    action: aws:executeAwsApi
+    inputs:
+      Service: ec2
+      Api: CreateSnapshot
+      VolumeId: "{{ getRootVolumeId.rootVolumeId }}"
+      Description: "{{ Description }}"
+    outputs:
+    - Name: Payload
+      Selector: SnapshotId
+      Type: String
+  - name: verifySnapshot
+    action: aws:waitForAwsResourceProperty
+    inputs:
+      Service: ec2
+      Api: DescribeSnapshots
+      SnapshotIds: ["{{createSnapshot.Payload}}"]
+      PropertySelector: Snapshots[0].State
+      DesiredValues:
+      - completed
+  - name: ModifyVolumeSize
+    action: 'aws:executeAwsApi'
+    maxAttempts: 3
+    onFailure: Abort
+    inputs:
+      Service: ec2
+      Api: ModifyVolume
+      Size: '{{ Size }}'
+      VolumeId: '{{ getRootVolumeId.rootVolumeId }}'
+  - name: ExpandVolume
+    action: 'aws:runCommand'
+    maxAttempts: 3
+    onFailure: Abort
+    inputs:
+      DocumentName: AWS-RunPowerShellScript
+      InstanceIds: 
+        - '{{ getInstanceDetails.Instance }}'
+      Parameters:
+        commands:
+          - "$Commands = @("
+          - "    '$DiskNumber = (Get-Partition -DriveLetter C).DiskNumber',"
+          - "    'Update-Disk -Number \"$DiskNumber\"',"
+          - "    '$Size = Get-PartitionSupportedSize -DriveLetter C',"
+          - "    'Resize-Partition -DriveLetter C -Size $Size.SizeMax'"
+          - ")"
+          - "$Parameter = @{"
+          - "    commands = $Commands"
+          - "}"
+          - "$Document = 'AWS-RunPowerShellScript'"
+          - ""
+          - "Try {"
+          - "    $Cmd = Send-SSMCommand -DocumentName $Document -Parameter $Parameter -InstanceId {{ getInstanceDetails.Instance }} -Region 'us-east-1'"
+          - "    While ($Cmd.Status -ne 'Success') {"
+          - "        $Cmd = Get-SSMCommand -CommandId $Cmd.CommandId"
+          - "        Start-Sleep 20"
+          - "    }"
+          - "    Write-Host \"C drive is extended\" -ForegroundColor Green"
+          - "}"
+          - "Catch {"
+          - "    Write-Host \"\""
+          - "    Write-Host \"Failed to extend drive\" -ForegroundColor Red"
+          - "}"
+    isCritical: 'false'
+    isEnd: 'true'
