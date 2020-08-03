@@ -7,3 +7,19 @@ Copyright (c) 2020. Amazon Web Services Ireland LTD. All Rights Reserved. AWS En
 
 ################################################################################################
 SSM EBS Resize EBS Volume and expand primary paritition
+
+Command will read the instance ID and how much the primary root volume should be extended (this number should be greater than existent size otherwise the automation will stop).
+
+This SSM Automation documente will perform the following steps:
+
+1) Get Instance Details - When entering InstanceID It will obtain the primary Root volume device name and the list of devices.
+
+2) Get Root Volume ID - it will use the main root device id and will obtain volume 0 VolumeID.
+
+3) CreateSnapshot - it will create a volume snapshot of the primary volume and will capture the snapshot id.
+
+4) Verify Snapshot - it will wait until the snapshot is complete 
+
+5) Modify Volume Size - it will use the Volume Size entered by the user and will modify the volume using the execute AWS API
+
+6) Expand Volume - it will use runcommand to execute a powershell script to expand the primary partition 
