@@ -15,13 +15,14 @@
 # SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #
 ---
-description: '## EBS Resize and Expand root Volume - EC2-Windows - VERSION 1.1'
+description: '## EBS Resize and Expand root Volume - EC2-Windows - VERSION 1.2'
 schemaVersion: '0.3'
 assumeRole: '<REPLACE WITH ARN ROLE>'
 outputs:
 - getInstanceDetails.Instance
 - getRootVolumeId.rootVolumeId
 - createSnapshot.Payload
+- ReadInstanceTag.InstanceName
 parameters:
   InstanceId:
     type: String
@@ -158,6 +159,7 @@ mainSteps:
       PropertySelector: 'Snapshots[0].State'
       DesiredValues:
         - completed
+    isCritical: 'true'
   - name: createTags
     action: aws:createTags
     maxAttempts: 3
@@ -170,6 +172,7 @@ mainSteps:
         Value: 'volume-expanded'
       - Key: service
         Value: ssm
+    isEnd: true 
   - name: PublishSNSsnapshotfail
     action: aws:executeAwsApi
     inputs:
