@@ -1,0 +1,196 @@
+#
+# Copyright 2021 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this
+# software and associated documentation files (the "Software"), to deal in the Software
+# without restriction, including without limitation the rights to use, copy, modify,
+# merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+# PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+#
+---
+description: '## EBS Resize and Expand root Volume - EC2-Windows - VERSION 1.1'
+schemaVersion: '0.3'
+assumeRole: '<REPLACE WITH ARN ROLE>'
+outputs:
+- getInstanceDetails.Instance
+- getRootVolumeId.rootVolumeId
+- createSnapshot.Payload
+parameters:
+  InstanceId:
+    type: String
+    description: (Required) ID of your EC2 Windows managed instance.
+  Size:
+    type: Integer
+    description: (Required) Target size for the selected volume in GB
+  Description:
+    type: String
+    description: "(Optional) A description for the snapshot"
+    default: ''
+mainSteps:
+  - name: getInstanceDetails
+    action: aws:executeAwsApi
+    onFailure: Abort
+    inputs:
+      Service: ec2
+      Api: DescribeInstances
+      InstanceIds:
+        - '{{ InstanceId }}'
+    outputs:
+    - Name: VolumeId
+      Selector: "$.Reservations[0].Instances[0].BlockDeviceMappings.EBS.VolumeId"
+      Type: String
+    - Name: Instance
+      Selector: "$.Reservations[0].Instances[0].InstanceId"
+      Type: String
+    - Name: rootDeviceName
+      Selector: "$.Reservations[0].Instances[0].RootDeviceName"
+      Type: String
+  - name: getRootVolumeId
+    action: aws:executeAwsApi
+    maxAttempts: 3
+    onFailure: Abort
+    inputs:
+      Service: ec2
+      Api: DescribeVolumes
+      Filters:
+      -  Name: attachment.device
+         Values: ["{{ getInstanceDetails.rootDeviceName }}"]
+      -  Name: attachment.instance-id
+         Values: ["{{ getInstanceDetails.Instance }}"]
+    outputs:
+      - Name: rootVolumeId
+        Selector: "$.Volumes[0].VolumeId"
+        Type: String
+  - name: ReadInstanceTag
+    action: 'aws:executeAwsApi'
+    inputs:
+      Api: DescribeTags
+      Service: EC2
+      Filters:
+      - Name: resource-id
+        Values: ["{{ InstanceId }}"]
+      - Name: tag:Name
+        Values: ['*']
+    outputs:
+    - Name: InstanceName
+      Selector: "$.Tags[0].Value"
+      Type: String
+  - name: createSnapshot
+    action: aws:executeAwsApi
+    inputs:
+      Service: ec2
+      Api: CreateSnapshot
+      VolumeId: "{{ getRootVolumeId.rootVolumeId }}"
+      Description: "{{ Description }}"
+    outputs:
+    - Name: Payload
+      Selector: SnapshotId
+      Type: String
+  - name: ModifyVolumeSize
+    action: 'aws:executeAwsApi'
+    maxAttempts: 3
+    onFailure: step:PublishSNSvolumefail
+    inputs:
+      Service: ec2
+      Api: ModifyVolume
+      Size: '{{ Size }}'
+      VolumeId: '{{ getRootVolumeId.rootVolumeId }}'
+  - name: "sleep"
+    action: "aws:sleep"
+    inputs:
+      Duration: "PT20S"
+  - name: ExpandVolume
+    action: 'aws:runCommand'
+    maxAttempts: 3
+    onFailure: step:PublishSNSPartitionfail
+    inputs:
+      DocumentName: AWS-RunPowerShellScript
+      InstanceIds: 
+        - '{{ getInstanceDetails.Instance }}'
+      Parameters:
+        commands:
+          - "$Commands = @("
+          - "    '$DiskNumber = (Get-Partition -DriveLetter C).DiskNumber',"
+          - "    'Update-Disk -Number \"$DiskNumber\"',"
+          - "    '$Size = Get-PartitionSupportedSize -DriveLetter C',"
+          - "    'Resize-Partition -DriveLetter C -Size $Size.SizeMax'"
+          - ")"
+          - "$Parameter = @{"
+          - "    commands = $Commands"
+          - "}"
+          - "$Document = 'AWS-RunPowerShellScript'"
+          - ""
+          - "Try {"
+          - "    $Cmd = Send-SSMCommand -DocumentName $Document -Parameter $Parameter -InstanceId {{ getInstanceDetails.Instance }} -Region 'us-east-1'"
+          - "    While ($Cmd.Status -ne 'Success') {"
+          - "        $Cmd = Get-SSMCommand -CommandId $Cmd.CommandId"
+          - "        Start-Sleep 20"
+          - "    }"
+          - "    Write-Host \"C drive is extended\" -ForegroundColor Green"
+          - "}"
+          - "Catch {"
+          - "    Write-Host \"\""
+          - "    Write-Host \"Failed to extend drive\" -ForegroundColor Red"
+          - "}"
+    isCritical: 'false'
+  - name: PublishSNSNotification
+    action: aws:executeAwsApi
+    inputs:
+      Service: sns
+      Api: Publish
+      TopicArn: "<REPLACE WITH TOPIC ARN>"
+      Message: "Root Volume {{ getRootVolumeId.rootVolumeId }} size increased from InstanceName {{ReadInstanceTag.InstanceName}}"
+  - name: verifySnapshot
+    action: 'aws:waitForAwsResourceProperty'
+    onFailure: step:PublishSNSsnapshotfail
+    inputs:
+      Service: ec2
+      Api: DescribeSnapshots
+      SnapshotIds:
+        - '{{ createSnapshot.Payload }}'
+      PropertySelector: 'Snapshots[0].State'
+      DesiredValues:
+        - completed
+  - name: createTags
+    action: aws:createTags
+    maxAttempts: 3
+    inputs:
+      ResourceType: EC2
+      ResourceIds:
+      - '{{ createSnapshot.Payload }}'
+      Tags:
+      - Key: Name
+        Value: 'volume-expanded'
+      - Key: service
+        Value: ssm
+  - name: PublishSNSsnapshotfail
+    action: aws:executeAwsApi
+    inputs:
+      Service: sns
+      Api: Publish
+      TopicArn: "<REPLACE WITH SNS TOPIC ARN>"
+      Message: "Create Snapshot failed to create from InstanceName {{ReadInstanceTag.InstanceName}}"     
+    isEnd: true 
+  - name: PublishSNSvolumefail
+    action: aws:executeAwsApi
+    inputs:
+      Service: sns
+      Api: Publish
+      TopicArn: "<REPLACE WITH SNS TOPIC ARN>"
+      Message: "Unable to increase Volume {{getRootVolumeId.rootVolumeId}} from InstanceName {{ReadInstanceTag.InstanceName}}"     
+    isEnd: true 
+  - name: PublishSNSPartitionfail
+    action: aws:executeAwsApi
+    inputs:
+      Service: sns
+      Api: Publish
+      TopicArn: "<REPLACE WITH SNS TOPIC ARN>"
+      Message: "Expand partition fail from instance InstanceName {{ReadInstanceTag.InstanceName}}"    
+    isEnd: true
