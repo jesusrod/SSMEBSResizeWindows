@@ -1,5 +1,5 @@
 #
-# Copyright 2020 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# Copyright 2021 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy of this
 # software and associated documentation files (the "Software"), to deal in the Software
@@ -15,9 +15,9 @@
 # SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #
 ---
-description: '## EBS Resize and Expand Volume'
+description: '## EBS Resize and Expand root Volume - EC2-Windows - VERSION 1.1'
 schemaVersion: '0.3'
-assumeRole: 'arn:aws:iam::079697969914:role/AmazonSSMRoleForAutomationAssumeQuickSetup'
+assumeRole: '<REPLACE WITH ARN ROLE>'
 outputs:
 - getInstanceDetails.Instance
 - getRootVolumeId.rootVolumeId
@@ -68,6 +68,20 @@ mainSteps:
       - Name: rootVolumeId
         Selector: "$.Volumes[0].VolumeId"
         Type: String
+  - name: ReadInstanceTag
+    action: 'aws:executeAwsApi'
+    inputs:
+      Api: DescribeTags
+      Service: EC2
+      Filters:
+      - Name: resource-id
+        Values: ["{{ InstanceId }}"]
+      - Name: tag:Name
+        Values: ['*']
+    outputs:
+    - Name: InstanceName
+      Selector: "$.Tags[0].Value"
+      Type: String
   - name: createSnapshot
     action: aws:executeAwsApi
     inputs:
@@ -79,28 +93,23 @@ mainSteps:
     - Name: Payload
       Selector: SnapshotId
       Type: String
-  - name: verifySnapshot
-    action: aws:waitForAwsResourceProperty
-    inputs:
-      Service: ec2
-      Api: DescribeSnapshots
-      SnapshotIds: ["{{createSnapshot.Payload}}"]
-      PropertySelector: Snapshots[0].State
-      DesiredValues:
-      - completed
   - name: ModifyVolumeSize
     action: 'aws:executeAwsApi'
     maxAttempts: 3
-    onFailure: Abort
+    onFailure: step:PublishSNSvolumefail
     inputs:
       Service: ec2
       Api: ModifyVolume
       Size: '{{ Size }}'
       VolumeId: '{{ getRootVolumeId.rootVolumeId }}'
+  - name: "sleep"
+    action: "aws:sleep"
+    inputs:
+      Duration: "PT20S"
   - name: ExpandVolume
     action: 'aws:runCommand'
     maxAttempts: 3
-    onFailure: Abort
+    onFailure: step:PublishSNSPartitionfail
     inputs:
       DocumentName: AWS-RunPowerShellScript
       InstanceIds: 
@@ -131,10 +140,27 @@ mainSteps:
           - "    Write-Host \"Failed to extend drive\" -ForegroundColor Red"
           - "}"
     isCritical: 'false'
+  - name: PublishSNSNotification
+    action: aws:executeAwsApi
+    inputs:
+      Service: sns
+      Api: Publish
+      TopicArn: "<REPLACE WITH TOPIC ARN>"
+      Message: "Root Volume {{ getRootVolumeId.rootVolumeId }} size increased from InstanceName {{ReadInstanceTag.InstanceName}}"
+  - name: verifySnapshot
+    action: 'aws:waitForAwsResourceProperty'
+    onFailure: step:PublishSNSsnapshotfail
+    inputs:
+      Service: ec2
+      Api: DescribeSnapshots
+      SnapshotIds:
+        - '{{ createSnapshot.Payload }}'
+      PropertySelector: 'Snapshots[0].State'
+      DesiredValues:
+        - completed
   - name: createTags
     action: aws:createTags
     maxAttempts: 3
-    onFailure: Abort
     inputs:
       ResourceType: EC2
       ResourceIds:
@@ -144,4 +170,27 @@ mainSteps:
         Value: 'volume-expanded'
       - Key: service
         Value: ssm
-    isEnd: 'true'
+  - name: PublishSNSsnapshotfail
+    action: aws:executeAwsApi
+    inputs:
+      Service: sns
+      Api: Publish
+      TopicArn: "<REPLACE WITH SNS TOPIC ARN>"
+      Message: "Create Snapshot failed to create from InstanceName {{ReadInstanceTag.InstanceName}}"     
+    isEnd: true 
+  - name: PublishSNSvolumefail
+    action: aws:executeAwsApi
+    inputs:
+      Service: sns
+      Api: Publish
+      TopicArn: "<REPLACE WITH SNS TOPIC ARN>"
+      Message: "Unable to increase Volume {{getRootVolumeId.rootVolumeId}} from InstanceName {{ReadInstanceTag.InstanceName}}"     
+    isEnd: true 
+  - name: PublishSNSPartitionfail
+    action: aws:executeAwsApi
+    inputs:
+      Service: sns
+      Api: Publish
+      TopicArn: "<REPLACE WITH SNS TOPIC ARN>"
+      Message: "Expand partition fail from instance InstanceName {{ReadInstanceTag.InstanceName}}"    
+    isEnd: true
